@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 
 #include <stdio.h>
+#include<math.h>
 
 /* USER CODE END Includes */
 
@@ -43,6 +44,9 @@
 
 /* Private variables ---------------------------------------------------------*/
 SPI_HandleTypeDef hspi2;
+
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart2;
 
@@ -95,6 +99,15 @@ float gx;
 float gy;
 float gz;
 
+uint32_t last_time = 0;
+float angle;
+float dt;
+
+int turn_done = 0;
+
+
+char msg[20] = "Turn performed";
+
 
 #define OUT_Z_L_A 			0x28
 
@@ -106,6 +119,30 @@ float gz;
 
 #define CTRL8				0x17
 
+
+volatile uint8_t firstEdgeCaptured = 0;
+
+volatile uint8_t lastEdgeCaptured = 0;
+
+volatile uint8_t measurementReady = 0;
+
+
+uint32_t IC_Value1 = 0;
+
+uint32_t IC_Value2 = 0;
+
+uint32_t time = 0;
+
+float distance = 0;
+
+
+static uint8_t imu_active = 0;
+
+
+
+
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -113,6 +150,8 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI2_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 
 void SPI_Read_Reg(uint8_t reg, char * name);
@@ -134,6 +173,14 @@ void Gyroscope_Conversion(void);
 void Read_Gyroscope_Calibration(float *gx, float *gy, float *gz);
 
 void Gyroscope_Bias_Offset(void);
+
+void Turn_on_Gyroscope();
+
+void Delay_us(uint16_t us);
+
+void IMU_On();
+
+void IMU_Off();
 
 /* USER CODE END PFP */
 
@@ -173,30 +220,42 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_SPI2_Init();
+  MX_TIM2_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
+
+  HAL_TIM_Base_Start(&htim6);
+
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
 
 
   SPI_Read_Reg(WHOAMI, "Whoami");
 
-  SPI_Write_Reg(CTRL1, 0x09);  // This configures the accelerometer register to work at high performance mode and under  a frequency of 960Hz
+//  SPI_Write_Reg(CTRL1, 0x09);  // This configures the accelerometer register to work at high performance mode and under  a frequency of 960Hz
 
   SPI_Write_Reg(CTRL3, 0x44); //BDU + IF_INC - This will apply to both the Accelerometer and the Gyroscope... there will not be a need to re-do it again
 
-  SPI_Write_Reg(CTRL8, 0x00); // This is setting the full scale(FS) for the accelerometer only
-
-  SPI_Read_Reg(CTRL1, "Accelerometer");
-
-  SPI_Write_Reg(CTRL2, 0x09);  // This configures the Gyroscope register to work at high performance mode and under  a frequency of 960Hz(Is waht actually turn on the sensor)
-
-
-  SPI_Write_Reg(CTRL6, 0x20); //Configuring the LPF and the Full Scale for the gyroscope
+//  SPI_Write_Reg(CTRL8, 0x00); // This is setting the full scale(FS) for the accelerometer only
+//
+//  SPI_Read_Reg(CTRL1, "Accelerometer");
+//
+//  SPI_Write_Reg(CTRL2, 0x09);  // This configures the Gyroscope register to work at high performance mode and under  a frequency of 960Hz(Is waht actually turn on the sensor)
+//
+//
+//  SPI_Write_Reg(CTRL6, 0x00); //Configuring the LPF and the Full Scale for the gyroscope(to 125dps)
 
 
   HAL_Delay(1000);
 
+  last_time = HAL_GetTick();
+
+  IMU_On();
+
   Gyroscope_Bias_Offset();
 
   Accelerometer_Bias_Offset();
+
+  IMU_Off();
 
 
   /* USER CODE END 2 */
@@ -214,11 +273,92 @@ int main(void)
 
 //	  Read_Gyroscope();
 
-	  Gyroscope_Conversion();
+//	  Gyroscope_Conversion();
 
-	  Accelerometer_Conversion();
+//	  Accelerometer_Conversion();
 
-	  HAL_Delay(500);
+//	   I want to trigger the Ultrasonic sensor
+
+	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
+	  Delay_us(2);
+
+	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);
+	  Delay_us(10);
+
+	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
+
+	  if(measurementReady){
+		  measurementReady = 0;
+
+
+		  time = IC_Value2 - IC_Value1; //Each timer tick is in microseconds...and therefore, the time difference is in microseconds
+
+		  distance = time * 0.034 / 2;
+
+	  		 char msg2[20];
+
+	  		 int len = snprintf(msg2, sizeof(msg2), "Distance: %.2f\n\r", distance);
+
+	  		 HAL_UART_Transmit(&huart2, (uint8_t *)msg2, len, HAL_MAX_DELAY);
+
+	  		 HAL_Delay(500);
+
+	  }
+
+	  if(distance < 20){
+
+		  if(!imu_active){
+		        IMU_On();
+		        last_time = HAL_GetTick();  // reset timing
+		        imu_active = 1;
+		    }
+
+
+		  Turn_on_Gyroscope();
+
+
+		  		 char msg1[20];
+
+		  		 int len = snprintf(msg1, sizeof(msg1), "Angle: %.2f\n\r", angle);
+
+		  		 HAL_UART_Transmit(&huart2, (uint8_t *)msg1, len, HAL_MAX_DELAY);
+
+		  		 HAL_Delay(500);
+
+		  	  if(fabs(angle) >= 90  && !turn_done){
+		  		  HAL_UART_Transmit(&huart2, (uint8_t *)msg, 20, HAL_MAX_DELAY);
+		  		  angle = 0;
+		  		  turn_done = 1;
+		  	  }
+
+		  	  if (turn_done) {
+		  	      HAL_Delay(2000);   // wait 2 seconds (or any time)
+
+		  	      angle = 0;
+		  	      turn_done = 0;
+
+		  	      // 🔥 VERY IMPORTANT: reset timing
+		  	      last_time = HAL_GetTick();
+		  	  }
+
+		  	  HAL_Delay(5);
+
+
+	  }
+
+	  else{
+		    if(imu_active){
+		        IMU_Off();
+
+		        angle = 0;
+		        imu_active = 0;
+
+		        last_time = HAL_GetTick();
+		    }
+	  }
+
+
+
 
   }
   /* USER CODE END 3 */
@@ -314,6 +454,102 @@ static void MX_SPI2_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 79;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 79;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 999;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -366,14 +602,24 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12|GPIO_PIN_3, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : PB12 */
-  GPIO_InitStruct.Pin = GPIO_PIN_12;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PB12 PB3 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_3;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PC7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -570,13 +816,88 @@ void Gyroscope_Conversion(void){
 	gy_conv = gy * 0.004375;
 	gz_conv = gz * 0.004375;
 
-	 char msg[90];
-
-		 int len = snprintf(msg, sizeof(msg), "\n\r gx_conv : %.2lf\n\r  gy_conv : %.2lf\n\r gz_conv : %.2lf\n\r ", gx_conv, gy_conv, gz_conv);
-
-		 HAL_UART_Transmit(&huart2, (uint8_t *)msg, len, HAL_MAX_DELAY);
 }
 
+void Turn_on_Gyroscope(){
+
+	uint32_t now = HAL_GetTick();
+	dt = (now - last_time) / 1000.0f;
+	last_time = now;
+
+	Read_Gyroscope_Calibration(&gx, &gy, &gz);
+
+	gz_conv = gz * 0.004375;
+
+	 if (fabs(gz_conv) < 0.5f) {
+	        gz_conv = 0;
+	    }
+
+	static float gz_filtered = 0;
+
+	gz_filtered = 0.7f * gz_filtered + 0.3f * gz_conv;
+
+	if(!turn_done){  // Limits this function to only perform the intergration if the turn is not done
+		angle +=  gz_filtered* dt;
+
+	}
+
+}
+
+void Delay_us(uint16_t us){  // The goodness with this timing function is that it will help us to implement the delays in microseconds
+	__HAL_TIM_SET_COUNTER(&htim6, 0);
+	while(__HAL_TIM_GET_COUNTER(&htim6) < us);
+}
+
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+  /* Prevent unused argument(s) compilation warning */
+  UNUSED(htim);
+
+  /* NOTE : This function should not be modified, when the callback is needed,
+            the HAL_TIM_IC_CaptureCallback could be implemented in the user file
+   */
+
+  if(htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1){
+
+	  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_7);
+
+	  if(firstEdgeCaptured == 0){
+		  IC_Value1 = HAL_TIM_ReadCapturedValue(&htim2, TIM_CHANNEL_1);
+
+		  firstEdgeCaptured = 1;
+
+		  __HAL_TIM_SET_CAPTUREPOLARITY(&htim2, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
+	  }
+
+	  else {
+		  IC_Value2 = HAL_TIM_ReadCapturedValue(&htim2, TIM_CHANNEL_1);
+
+		  firstEdgeCaptured = 0;
+
+		  measurementReady = 1;
+
+		  __HAL_TIM_SET_CAPTUREPOLARITY(&htim2, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
+
+	  }
+
+  }
+}
+
+void IMU_On(){
+	  SPI_Write_Reg(CTRL1, 0x09); // This configures the accelerometer register to work at high performance mode and under  a frequency of 960Hz
+	  SPI_Write_Reg(CTRL8, 0x00); // This is setting the full scale(FS) for the accelerometer only
+
+	  SPI_Write_Reg(CTRL2, 0x09);  // This configures the Gyroscope register to work at high performance mode and under  a frequency of 960Hz(Is waht actually turn on the sensor)
+	  SPI_Write_Reg(CTRL6, 0x00); //Configuring the LPF and the Full Scale for the gyroscope(to 125dps)
+
+}
+
+
+void IMU_Off(){
+	  SPI_Write_Reg(CTRL1, 0x00);
+	  SPI_Write_Reg(CTRL2, 0x00);
+}
 
 /* USER CODE END 4 */
 
